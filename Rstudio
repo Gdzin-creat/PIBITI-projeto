@@ -1,0 +1,160 @@
+
+# ======================== app.R ========================
+library(shiny)
+library(DBI)
+library(RSQLite)
+library(dotenv)
+
+# Carregar variáveis de ambiente
+dotenv::load_dot_env(file = ".env")
+Sys.setenv(OPENAI_API_KEY = Sys.getenv("OPENAI_API_KEY"))
+Sys.setenv(PINECONE_API_KEY = Sys.getenv("PINECONE_API_KEY"))
+
+# Diretórios
+if (!dir.exists("docs")) dir.create("docs")
+if (!dir.exists("database")) dir.create("database")
+
+# Banco de dados
+db_path <- "database/app_data.db"
+con <- dbConnect(SQLite(), dbname = db_path)
+dbExecute(con, "CREATE TABLE IF NOT EXISTS pdfs (id INTEGER PRIMARY KEY, file_name TEXT, file_path TEXT)")
+dbExecute(con, "CREATE TABLE IF NOT EXISTS qas (id INTEGER PRIMARY KEY, pdf_id INTEGER, question TEXT, answer TEXT)")
+dbDisconnect(con)
+
+# Helpers R
+buscar_historico <- function(pdf_id, n = 5) {
+  con <- dbConnect(SQLite(), dbname = db_path)
+  df <- dbGetQuery(con, sprintf(
+    "SELECT question, answer FROM qas WHERE pdf_id = %d ORDER BY id DESC LIMIT %d",
+    pdf_id, n
+  ))
+  dbDisconnect(con)
+  df[rev(seq_len(nrow(df))), ]
+}
+
+salvar_pdf <- function(nome, caminho) {
+  con <- dbConnect(SQLite(), dbname = db_path)
+  dbExecute(con, "INSERT INTO pdfs (file_name, file_path) VALUES (?, ?)", params = list(nome, caminho))
+  id <- dbGetQuery(con, "SELECT last_insert_rowid() AS id")$id
+  dbDisconnect(con)
+  id
+}
+
+salvar_qa <- function(pdf_id, pergunta, resposta) {
+  con <- dbConnect(SQLite(), dbname = db_path)
+  dbExecute(con, "INSERT INTO qas (pdf_id, question, answer) VALUES (?, ?, ?)",
+            params = list(pdf_id, pergunta, resposta))
+  dbDisconnect(con)
+}
+
+# Carrega backend Python
+library(reticulate)
+use_virtualenv("langchain_rag", required = TRUE)
+source_python("backend3.py")
+
+#appShyni
+
+ui <- fluidPage(
+  titlePanel("Chat com PDFs - IA by Shiny"),
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("pdf_file", "📄 Enviar PDF:", accept = ".pdf"),
+      actionButton("add_pdf", "📥 Adicionar PDF"),
+      textInput("question", "❓ Sua Pergunta:"),
+      actionButton("ask", "🔍 Perguntar"),
+      actionButton("clear_history", "🧹 Limpar Histórico"),
+      hr(),
+      helpText("Após o upload, aguarde a indexação."),
+      verbatimTextOutput("info")
+    ),
+    mainPanel(
+      div(
+        style = "max-height: 600px; overflow-y: auto; padding: 10px; border: 1px solid #ccc; font-family: Arial, sans-serif;",
+        uiOutput("history")
+      )
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  pergunta_texto <- reactiveVal("")
+  resposta_texto <- reactiveVal("")
+  pdf_id_atual <- reactiveVal(NULL)
+  caminho_pdf_atual <- reactiveVal(NULL)
+  historico <- reactiveVal(list())
+  
+  output$info <- renderPrint({
+    if (!is.null(pdf_id_atual())) paste("PDF ID atual:", pdf_id_atual()) else "Nenhum PDF carregado."
+  })
+  
+  observeEvent(input$add_pdf, {
+    req(input$pdf_file)
+    dest <- file.path("docs", input$pdf_file$name)
+    file.copy(input$pdf_file$datapath, dest, overwrite = TRUE)
+    showNotification(paste("📥 Carregando PDF:", input$pdf_file$name), type = "message", duration = 3)
+    withProgress(message = "Indexando PDF no Pinecone...", value = 0, {
+      incProgress(0.2)
+      id <- salvar_pdf(input$pdf_file$name, dest)
+      pdf_id_atual(id)
+      caminho_pdf_atual(dest)
+      incProgress(0.4)
+      res <- tryCatch({
+        as.character(py$adicionar_pdf(dest, as.integer(id)))
+      }, error = function(e) {
+        paste("Erro ao chamar backend Python:", e$message)
+      })
+      incProgress(0.8)
+      Sys.sleep(0.3)
+      incProgress(1)
+      if (is.character(res) && startsWith(res, "Sucesso:")) {
+        showNotification(res, type = "message")
+      } else {
+        showNotification(paste("❌ Erro ao indexar PDF:", res), type = "error")
+      }
+    })
+  })
+  
+  observeEvent(input$ask, {
+    req(input$question, pdf_id_atual())
+    pergunta <- input$question
+    resposta <- tryCatch({
+      as.character(py$perguntar(pergunta, as.integer(pdf_id_atual())))
+    }, error = function(e) {
+      paste("Erro ao chamar função de pergunta:", e$message)
+    })
+    pergunta_texto(pergunta)
+    resposta_texto(resposta)
+    salvar_qa(pdf_id_atual(), pergunta, resposta)
+    novo <- list(pergunta = pergunta, resposta = resposta)
+    historico(c(historico(), list(novo)))
+  })
+  
+  observeEvent(input$clear_history, {
+    historico(list())
+    showNotification("Histórico limpo!", type = "message", duration = 2)
+  })
+  
+  formatar_html <- function(texto) {
+    gsub("\\*(.*?)\\*", "<b>\\1</b>", texto)
+  }
+  
+  output$history <- renderUI({
+    hist <- historico()
+    if (length(hist) == 0) return(NULL)
+    tagList(
+      lapply(seq_along(hist), function(i) {
+        h <- hist[[i]]
+        div(style = "margin-bottom: 20px;",
+            HTML(paste0(
+              "<div style='font-size: 15px; line-height: 1.6;'>",
+              "<b>❓ Pergunta:</b><br><ul><li>", formatar_html(h$pergunta), "</li></ul><br>",
+              "<b>🧠 Resposta:</b><br><ul><li>", formatar_html(h$resposta), "</li></ul>",
+              "<hr></div>"
+            ))
+        )
+      })
+    )
+  })
+}
+
+shinyApp(ui, server)
